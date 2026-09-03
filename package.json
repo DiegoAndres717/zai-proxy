@@ -1,0 +1,13 @@
+{
+  "name": "zai-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node server.mjs --test"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  },
+  "packageManager": "pnpm@11.7.0"
+}
