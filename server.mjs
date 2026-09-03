@@ -38,7 +38,9 @@ Para usar herramientas responde SOLO con un bloque:
 \`\`\`json
 {"tool_calls":[{"name":"<nombre>","arguments":{...}}]}
 \`\`\`
-Recibirás los resultados como "TOOL RESULT <nombre>:". Cuando termines, responde en texto normal sin ese bloque.`;
+Reglas:
+- Si necesitas una herramienta, el bloque JSON va en ESTA misma respuesta. Nunca anuncies lo que vas a hacer sin hacerlo.
+- Recibirás los resultados como "TOOL RESULT <nombre>:". Después, sigue con la siguiente herramienta o responde en texto normal sin bloque.`;
 
 // Busca `{"tool_calls":[...]}` en el texto respetando strings JSON (los argumentos pueden traer llaves, p.ej. código).
 /** @param {string} text */
@@ -197,10 +199,10 @@ async function browser() {
 }
 
 /**
- * @param {boolean} fresh @param {string} prompt @param {(text: string) => void} onPartial
+ * @param {boolean} fresh @param {string} prompt @param {(text: string) => void} onPartial @param {boolean} [side] petición aparte: no toca el hilo principal
  * @returns {Promise<{ text: string, usage?: Usage }>}
  */
-async function ask(fresh, prompt, onPartial) {
+async function ask(fresh, prompt, onPartial, side = false) {
   const p = await browser();
   const target = fresh || !threadUrl ? site.url : threadUrl;
   if (fresh || p.url() !== target) { await p.goto(target, { waitUntil: 'domcontentloaded' }); await p.waitForSelector(site.input); }
@@ -210,7 +212,7 @@ async function ask(fresh, prompt, onPartial) {
     const captcha = setTimeout(async () => { if (site.captchaText && (await p.getByText(site.captchaText).count())) console.log('[proxy] captcha: resuélvelo en la ventana del navegador'); }, 5000);
     onChunk = site.makeParser(onPartial, (text, usage) => {
       clearTimeout(timer); clearTimeout(captcha); onChunk = () => {};
-      threadUrl = p.url();
+      if (!side) threadUrl = p.url();
       resolve({ text: text.trim(), usage });
     }, abortCurrent);
     p.fill(site.input, prompt).then(() => p.click(site.send)).catch((e) => { clearTimeout(timer); reject(e); });
@@ -232,15 +234,30 @@ async function complete(body, onPartial) {
   const meta = metaReply(body.messages);
   if (meta) return { msg: { role: 'assistant', content: meta }, finish_reason: 'stop' };
   const d = delta(sentKeys, body.messages);
+  // ponytail: peticiones internas de grok sin tools que no continúan el hilo (p.ej. extracción de memoria) van a un chat aparte
+  // sin tocar el estado del hilo principal.
+  if (d.fresh && !body.tools?.length && sentKeys.length) {
+    console.log('[proxy] petición aparte, no toca el hilo');
+    const r = await ask(true, body.messages.map(renderMessage).join('\n\n'), onPartial, true);
+    return { msg: { role: 'assistant', content: r.text }, finish_reason: 'stop', usage: r.usage };
+  }
   const fresh = d.fresh || turns >= MAX_TURNS;
   const { keys } = d, msgs = fresh ? body.messages : d.msgs;
   turns = fresh ? 1 : turns + 1;
   console.log(`[proxy] ${fresh ? 'chat nuevo' : 'sigue en el chat'} (+${msgs.length} mensajes, turno ${turns})`);
   const parts = msgs.map(renderMessage);
   if (fresh && body.tools?.length) parts.unshift(toolPrompt(body.tools));
-  const r = await ask(fresh, parts.join('\n\n'), onPartial);
+  let r = await ask(fresh, parts.join('\n\n'), onPartial);
+  let parsed = parseToolCalls(r.text);
+  // ponytail: si el modelo narra ("voy a revisar…") en vez de llamar la herramienta, se le empuja una vez.
+  if (body.tools?.length && !parsed.tool_calls && /^\s*(voy a|primero|déjame|dejame|ahora|let me|i'?ll|i will|first)\b/i.test(r.text)) {
+    console.log('[proxy] narró sin llamar herramienta, le insisto');
+    const r2 = await ask(false, 'Hazlo ahora: responde SOLO con el bloque JSON de tool_calls.', () => {});
+    const p2 = parseToolCalls(r2.text);
+    if (p2.tool_calls) { parsed = { content: [r.text, p2.content].filter(Boolean).join('\n'), tool_calls: p2.tool_calls }; r = { text: r.text + r2.text, usage: r2.usage }; }
+  }
   if (r.text) sentKeys = [...keys, 'assistant']; // respuesta vacía: el reintento de grok reenvía lo mismo en este chat
-  const msg = { role: /** @type {const} */ ('assistant'), ...parseToolCalls(r.text) };
+  const msg = { role: /** @type {const} */ ('assistant'), ...parsed };
   return { msg, finish_reason: msg.tool_calls ? 'tool_calls' : 'stop', usage: r.usage };
 }
 
