@@ -4,10 +4,16 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node server.mjs --test"
+    "test": "node server.mjs --test",
+    "typecheck": "tsc -p jsconfig.json",
+    "inspect": "node inspect.mjs"
   },
   "dependencies": {
     "playwright": "^1.62.1"
   },
-  "packageManager": "pnpm@11.7.0"
+  "packageManager": "pnpm@11.7.0",
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
+  }
 }
