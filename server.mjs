@@ -209,13 +209,18 @@ async function ask(fresh, prompt, onPartial, side = false) {
   if (fresh) await site.onFreshChat?.(p, THINKING).catch(() => {});
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { onChunk = () => {}; reject(new Error(`timeout esperando respuesta de ${site.name}`)); }, REPLY_TIMEOUT_MS);
-    const captcha = setTimeout(async () => { if (site.captchaText && (await p.getByText(site.captchaText).count())) console.log('[proxy] captcha: resuélvelo en la ventana del navegador'); }, 5000);
+    const captcha = setInterval(async () => {
+      if (!site.captchaText || !(await p.getByText(site.captchaText).count().catch(() => 0))) return;
+      clearInterval(captcha); await p.bringToFront().catch(() => {});
+      console.log('[proxy] CAPTCHA: resuélvelo en la ventana del navegador (espero hasta 15 min)');
+    }, 4000);
     onChunk = site.makeParser(onPartial, (text, usage) => {
-      clearTimeout(timer); clearTimeout(captcha); onChunk = () => {};
+      clearTimeout(timer); clearInterval(captcha); onChunk = () => {};
       if (!side) threadUrl = p.url();
       resolve({ text: text.trim(), usage });
     }, abortCurrent);
-    p.fill(site.input, prompt).then(() => p.click(site.send)).catch((e) => { clearTimeout(timer); reject(e); });
+    // el click espera a que el botón sea accionable: con un captcha delante, hasta que lo resuelvas
+    p.fill(site.input, prompt, { timeout: REPLY_TIMEOUT_MS }).then(() => p.click(site.send, { timeout: REPLY_TIMEOUT_MS })).catch((e) => { clearTimeout(timer); clearInterval(captcha); reject(e); });
   });
 }
 
@@ -289,10 +294,16 @@ if (isMain && !process.argv.includes('--test')) {
       if (safe.length > streamed.length) { chunk({ role: streamed ? undefined : 'assistant', content: safe.slice(streamed.length) }); streamed = safe; }
     };
     res.on('close', () => { if (!finished) { console.log('[proxy] cliente canceló, corto la generación'); abortCurrent(); } });
+    // latidos SSE mientras se espera (captcha, cola): grok no cancela por inactividad
+    const keepalive = body.stream ? setInterval(() => {
+      if (res.destroyed) return;
+      if (!headersSent) { res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' }); headersSent = true; }
+      res.write(': keepalive\n\n');
+    }, 15_000) : undefined;
     try {
       const run = () => complete(body, onPartial);
       const { msg, finish_reason, usage } = await (queue = queue.then(run, run));
-      finished = true;
+      finished = true; clearInterval(keepalive);
       console.log(`[proxy] -> ${finish_reason} ${msg.tool_calls ? msg.tool_calls.map((c) => c.function.name).join(',') : JSON.stringify((msg.content ?? '').slice(0, 80))}`);
       if (!body.stream) return json(res, 200, { ...base, object: 'chat.completion', choices: [{ index: 0, message: msg, finish_reason, logprobs: null }], usage: toUsage(usage) });
       const final = msg.content ?? '';
@@ -301,10 +312,11 @@ if (isMain && !process.argv.includes('--test')) {
       chunk({}, finish_reason, toUsage(usage));
       res.end('data: [DONE]\n\n');
     } catch (e) {
+      finished = true; clearInterval(keepalive);
       const message = e instanceof Error ? e.message : String(e);
       console.error('[proxy]', message);
       if (res.destroyed) return;
-      if (headersSent) res.end('data: [DONE]\n\n'); else json(res, 500, { error: { message } });
+      if (headersSent) res.end(`data: ${JSON.stringify({ error: { message } })}\n\ndata: [DONE]\n\n`); else json(res, 500, { error: { message } });
     }
   }).listen(PORT, '127.0.0.1', () => console.log(`[proxy] http://127.0.0.1:${PORT}/v1  (Ctrl+C para salir)`));
   browser().catch((e) => { console.error('[proxy] no pude abrir el navegador:', e instanceof Error ? e.message : e); process.exit(1); });
